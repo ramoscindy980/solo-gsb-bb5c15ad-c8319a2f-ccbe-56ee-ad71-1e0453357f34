@@ -6,16 +6,26 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from .models import Stay, StayRequest, StayResponse, Stats
-from .staypoint import Point, detect_stays, total_distance_m
+from .hotspot import find_hotspots
+from .models import (
+    Hotspot,
+    HotspotRequest,
+    HotspotResponse,
+    HotspotStay,
+    Stay,
+    StayRequest,
+    StayResponse,
+    Stats,
+)
+from .staypoint import Point, StaySegment, detect_stays, total_distance_m
 
 app = FastAPI(
     title="轨迹停留分析 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交带时间戳的有序轨迹，按 Haversine 距离与最短停留时长阈值流式合并连续点，"
         "识别停留区段（含跨采样间断切分），返回停留时长、中心点、原始点范围，"
-        "并提供 GeoJSON 结果与总里程、停留次数统计。"
+        "并提供 GeoJSON 结果、总里程统计，以及基于停留中心连通分量的跨时段热点归并。"
     ),
 )
 
@@ -24,18 +34,34 @@ def _to_points(req: StayRequest) -> List[Point]:
     return [(p.lat, p.lon, p.timestamp) for p in req.points]
 
 
-def _analyze(req: StayRequest) -> StayResponse:
+def _detect_segments(req: StayRequest) -> List[StaySegment]:
     points = _to_points(req)
     max_gap_s = (
         req.max_gap_s if req.max_gap_s is not None else 4 * req.min_stay_duration_s
     )
-    segments = detect_stays(
+    return detect_stays(
         points,
         distance_threshold_m=req.distance_threshold_m,
         min_stay_duration_s=req.min_stay_duration_s,
         max_gap_s=max_gap_s,
     )
-    stays = [
+
+
+def _build_stats(points: List[Point], stays: List[Stay]) -> Stats:
+    total_duration_s = (
+        (points[-1][2] - points[0][2]).total_seconds() if len(points) > 1 else 0.0
+    )
+    return Stats(
+        point_count=len(points),
+        total_distance_m=round(total_distance_m(points), 3),
+        total_duration_s=total_duration_s,
+        stay_count=len(stays),
+        total_stay_duration_s=sum(s.duration_s for s in stays),
+    )
+
+
+def _segments_to_stays(segments: List[StaySegment]) -> List[Stay]:
+    return [
         Stay(
             stay_id=i + 1,
             center_lat=seg.center_lat,
@@ -49,17 +75,55 @@ def _analyze(req: StayRequest) -> StayResponse:
         )
         for i, seg in enumerate(segments)
     ]
-    total_duration_s = (
-        (points[-1][2] - points[0][2]).total_seconds() if len(points) > 1 else 0.0
+
+
+def _analyze(req: StayRequest) -> StayResponse:
+    points = _to_points(req)
+    stays = _segments_to_stays(_detect_segments(req))
+    return StayResponse(stays=stays, stats=_build_stats(points, stays))
+
+
+def _analyze_hotspots(req: HotspotRequest) -> HotspotResponse:
+    points = _to_points(req)
+    segments = _detect_segments(req)
+    clusters, assignment = find_hotspots(
+        segments,
+        hotspot_radius_m=req.hotspot_radius_m,
+        min_visits=req.min_visits,
     )
-    stats = Stats(
-        point_count=len(points),
-        total_distance_m=round(total_distance_m(points), 3),
-        total_duration_s=total_duration_s,
-        stay_count=len(stays),
-        total_stay_duration_s=sum(s.duration_s for s in stays),
+
+    stays = [
+        HotspotStay(
+            stay_id=i + 1,
+            center_lat=seg.center_lat,
+            center_lon=seg.center_lon,
+            start_time=seg.start_time,
+            end_time=seg.end_time,
+            duration_s=seg.duration_s,
+            start_index=seg.start_index,
+            end_index=seg.end_index,
+            point_count=seg.point_count,
+            hotspot_id=assignment[i],
+            noise=assignment[i] is None,
+        )
+        for i, seg in enumerate(segments)
+    ]
+    hotspots = [
+        Hotspot(
+            hotspot_id=c.hotspot_id,
+            visit_count=c.visit_count,
+            total_duration_s=round(c.total_duration_s, 3),
+            center_lat=c.center_lat,
+            center_lon=c.center_lon,
+            first_visit_time=c.first_visit_time,
+            last_visit_time=c.last_visit_time,
+            stay_ids=[idx + 1 for idx in c.member_indices],
+        )
+        for c in clusters
+    ]
+    return HotspotResponse(
+        stays=stays, hotspots=hotspots, stats=_build_stats(points, stays)
     )
-    return StayResponse(stays=stays, stats=stats)
 
 
 @app.get("/health", summary="健康检查")
@@ -74,6 +138,15 @@ def health() -> dict:
 )
 def analyze_stays(req: StayRequest) -> StayResponse:
     return _analyze(req)
+
+
+@app.post(
+    "/api/v1/hotspots",
+    response_model=HotspotResponse,
+    summary="跨时段热点归并（停留中心连通分量）",
+)
+def analyze_hotspots(req: HotspotRequest) -> HotspotResponse:
+    return _analyze_hotspots(req)
 
 
 @app.post(

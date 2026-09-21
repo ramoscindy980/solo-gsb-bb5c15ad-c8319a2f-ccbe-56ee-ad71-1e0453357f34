@@ -1,9 +1,10 @@
 # 轨迹停留分析 API（Trajectory Stay Analysis）
 
-基于 **FastAPI** 的轨迹停留点（Stay Point）分析服务。客户端提交带时间戳、经纬度的**有序轨迹**，
+基于 **FastAPI** 的轨迹停留点（Stay Point）分析与跨时段热点归并服务。客户端提交带时间戳、经纬度的**有序轨迹**，
 以及距离阈值、最短停留时长阈值；服务按 **Haversine** 距离和时间间隔**流式合并**连续点，
 识别停留区段的**进入 / 离开**时间与**跨采样间断**，返回每个停留的**时长、中心点、原始点下标范围**，
-并附带 **GeoJSON** 结果与**总里程、停留次数**等统计。
+并附带 **GeoJSON** 结果与**总里程、停留次数**等统计。`/api/v1/hotspots` 进一步在停留结果之上
+以**中心连通分量**归并跨时段重复到访，输出热点（含传递扩展、稳定编号、时长加权中心）与噪声标记。
 
 ## 功能特性
 
@@ -12,6 +13,8 @@
 - 每个停留返回：进入 / 离开时间、停留时长、中心点（簇内均值）、原始点下标闭区间、点数
 - 整体统计：总里程（Haversine 累计）、轨迹总时长、停留次数、停留总时长
 - GeoJSON 输出：轨迹 LineString + 停留点 Point 的 FeatureCollection，可直接上图（GeoJSON.io / Kepler 等）
+- **跨时段热点归并**：停留中心间距离 ≤ 半径连无向边，并查集求连通分量；支持“甲邻乙、乙邻丙、
+  甲不邻丙”的传递扩展，结果不随遍历顺序改变；热点按最早访问时间稳定编号，中心按停留时长加权
 - 时间戳兼容 ISO 8601 字符串与 Unix 秒（epoch）；参数校验失败返回 422
 
 ## 快速开始
@@ -122,7 +125,92 @@ curl -X POST http://localhost:8000/api/v1/stays \
 | `stats.stay_count` | 停留次数 |
 | `stats.total_stay_duration_s` | 停留总时长（秒） |
 
-### 2. `POST /api/v1/stays/geojson` — GeoJSON 结果
+### 2. `POST /api/v1/hotspots` — 跨时段热点归并
+
+**请求体**：完整沿用 `POST /api/v1/stays` 的全部字段（`points`、`distance_threshold_m`、
+`min_stay_duration_s`、`max_gap_s`），并额外要求：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `hotspot_radius_m` | float | 是 | — | 热点半径（米）：两段停留中心间 Haversine 距离 **不超过**该值则连边，须 > 0 |
+| `min_visits` | int | 是 | — | 最少访问次数：连通分量内停留段数达到该值才判为热点，须 ≥ 1 |
+
+服务**先按既有算法识别停留**，再在停留中心构成的无向图上求**连通分量**：
+
+- 访问次数（分量内停留段数）`>= min_visits` → **热点**；
+- 其余分量中的停留全部标记为**噪声**（`hotspot_id: null`、`noise: true`）；
+- 边按无向处理，连通分量支持**链式传递**——“甲邻乙、乙邻丙、甲不邻丙”三者仍属同一热点，
+  且分量划分**不随输入 / 遍历顺序改变**（并查集，边按规范序枚举）；
+- 热点编号按分量**最早访问时间**升序从 1 分配（持平再按最小停留下标），与遍历顺序无关；
+- 热点中心为成员停留中心按**停留时长加权**的平均（总权重为 0 时退化为等权均值）。
+
+**请求示例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/hotspots \
+  -H 'Content-Type: application/json' \
+  -d @examples/hotspot_request.json
+```
+
+`examples/hotspot_request.json` 描述的场景：一天内 6 次停留——
+家 H 到访 2 次、远一点的 F 与中间点 M 各 1 次（H-M、M-F 各约 111 m，H-F 约 222 m）、
+公司 W 到访 2 次（距 H 约 10 km）。半径 150 m、`min_visits=2` 时：
+H/M/F 靠**传递**归为热点 1（4 次访问），W 为热点 2（2 次访问），无噪声。
+
+**响应示例**（实际输出，节选自上述请求）
+
+```json
+{
+  "stays": [
+    {"stay_id": 1, "hotspot_id": 1, "noise": false, "center_lat": 39.9, "...": "..."},
+    {"stay_id": 2, "hotspot_id": 1, "noise": false, "center_lat": 39.902, "...": "..."},
+    {"stay_id": 3, "hotspot_id": 2, "noise": false, "center_lat": 39.99, "...": "..."},
+    {"stay_id": 4, "hotspot_id": 1, "noise": false, "center_lat": 39.901, "...": "..."},
+    {"stay_id": 5, "hotspot_id": 1, "noise": false, "center_lat": 39.9, "...": "..."},
+    {"stay_id": 6, "hotspot_id": 2, "noise": false, "center_lat": 39.99, "...": "..."}
+  ],
+  "hotspots": [
+    {
+      "hotspot_id": 1,
+      "visit_count": 4,
+      "total_duration_s": 720.0,
+      "center_lat": 39.90075,
+      "center_lon": 116.4,
+      "first_visit_time": "2026-09-21T08:00:00Z",
+      "last_visit_time": "2026-09-21T11:23:00Z",
+      "stay_ids": [1, 2, 4, 5]
+    },
+    {
+      "hotspot_id": 2,
+      "visit_count": 2,
+      "total_duration_s": 360.0,
+      "center_lat": 39.99,
+      "center_lon": 116.4,
+      "first_visit_time": "2026-09-21T09:40:00Z",
+      "last_visit_time": "2026-09-21T12:13:00Z",
+      "stay_ids": [3, 6]
+    }
+  ],
+  "stats": { "point_count": 24, "stay_count": 6, "...": "..." }
+}
+```
+
+**响应字段**
+
+| 字段 | 说明 |
+| --- | --- |
+| `stays[]` | 停留字段与 `/api/v1/stays` 完全一致，另附热点归属 |
+| `stays[].hotspot_id` | 所属热点编号（从 1 开始）；噪声停留为 `null` |
+| `stays[].noise` | 是否为噪声停留（不属于任何热点） |
+| `hotspots[].hotspot_id` | 热点编号，按最早访问时间升序，从 1 开始 |
+| `hotspots[].visit_count` | 访问次数（连通分量内停留段数） |
+| `hotspots[].total_duration_s` | 成员停留累计停留时长（秒） |
+| `hotspots[].center_lat / center_lon` | 热点中心：成员停留中心按停留时长加权平均 |
+| `hotspots[].first_visit_time / last_visit_time` | 最早进入 / 最晚离开时间 |
+| `hotspots[].stay_ids` | 成员停留的 `stay_id`（升序） |
+| `stats` | 与 `/api/v1/stays` 相同的整体统计 |
+
+### 3. `POST /api/v1/stays/geojson` — GeoJSON 结果
 
 请求体与上相同。返回 `application/geo+json` 的 `FeatureCollection`：
 
@@ -135,7 +223,7 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
   -d @examples/request.json | jq .
 ```
 
-### 3. `GET /health` — 健康检查
+### 4. `GET /health` — 健康检查
 
 ```json
 {"status": "ok"}
@@ -154,6 +242,21 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 5. 停留中心取簇内所有点的经纬度均值；总里程为相邻点 Haversine 距离之和
    （地球平均半径 6371008.8 m）。
 
+### 跨时段热点归并（`app/hotspot.py`）
+
+在上述停留区段结果之上进行二次聚合（停留之间即使跨越采样间断 / 多日也可归并）：
+
+1. 以每段停留的**中心**为节点；对所有停留对（按 `i < j` 的规范顺序）计算 Haversine 距离，
+   距离 `<= hotspot_radius_m` 则连一条**无向边**（含等号边界）；
+2. 用**并查集**（路径压缩 + 按大小合并）求无向图的**连通分量**：
+   连边关系天然支持传递——“甲邻乙、乙邻丙、甲不邻丙”三者同属一个分量；
+   连通分量是无向图的固有划分，**不随输入顺序或遍历顺序变化**；
+3. 分量成员停留数（**访问次数**）`>= min_visits` 判为**热点**，其余停留全部标记为**噪声**；
+4. 热点**稳定编号**：按分量内最早停留进入时间升序分配 `hotspot_id`（持平按最小停留下标），
+   成员 `stay_id` 按升序列出；
+5. 热点中心 = 成员停留中心以各自 `duration_s` 为权重的加权平均（权重总和为 0 时取等权均值）；
+   `total_duration_s` 为成员停留时长之和，`visit_count` 为成员停留段数。
+
 > 注意：输入轨迹须按时间升序排列；`start_index` / `end_index` 对应请求数组中的原始下标。
 
 ## 项目结构
@@ -161,14 +264,18 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用与路由
+│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/stays/geojson）
 │   ├── models.py        # Pydantic 请求 / 响应模型
-│   └── staypoint.py     # Haversine 与停留检测核心算法（纯函数）
+│   ├── staypoint.py     # Haversine 与停留检测核心算法（纯函数）
+│   └── hotspot.py       # 热点归并：连通分量（并查集）+ 时长加权中心（纯函数）
 ├── tests/
-│   ├── test_api.py        # API 集成测试（TestClient）
-│   └── test_staypoint.py  # 算法单元测试
+│   ├── test_api.py          # /stays 接口集成测试（TestClient）
+│   ├── test_staypoint.py    # 停留检测算法单元测试
+│   ├── test_hotspot.py      # 热点归并算法单元测试（传递扩展、顺序无关、稳定编号）
+│   └── test_hotspot_api.py  # /hotspots 接口集成测试
 ├── examples/
-│   └── request.json     # 示例请求体
+│   ├── request.json         # /stays 示例请求体
+│   └── hotspot_request.json # /hotspots 示例请求体
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt       # 运行依赖
@@ -182,5 +289,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-共 11 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、
-GeoJSON 结构、参数校验（422）等。
+共 25 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、
+GeoJSON 结构、参数校验（422），以及热点的链式传递扩展、多分量与噪声标记、
+`min_visits` 过滤、半径边界（含等号）、时长加权中心、最早访问时间稳定编号、
+打乱 / 颠倒输入顺序后的结果确定性等。

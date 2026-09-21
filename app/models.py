@@ -86,6 +86,49 @@ class Stats(BaseModel):
     total_stay_duration_s: float = Field(..., description="停留总时长（秒）")
 
 
+class HotspotRequest(StayRequest):
+    """热点归并请求：沿用停留检测参数，追加热点判定参数。"""
+
+    hotspot_radius_m: float = Field(
+        ...,
+        gt=0,
+        description="热点半径（米）：两段停留中心间 Haversine 距离不超过该值则连边",
+    )
+    min_visits: int = Field(
+        ...,
+        ge=1,
+        description="最少访问次数：连通分量内停留数达到该值才判为热点，否则为噪声",
+    )
+
+
+class HotspotStay(Stay):
+    """带热点归属的停留区段。"""
+
+    hotspot_id: Optional[int] = Field(
+        ..., description="所属热点编号（从 1 开始）；噪声停留为 null"
+    )
+    noise: bool = Field(..., description="是否为噪声停留（不属于任何热点）")
+
+
+class Hotspot(BaseModel):
+    """一个热点：中心间距离连边后达标的连通分量。"""
+
+    hotspot_id: int = Field(..., description="热点编号，按最早访问时间从 1 开始")
+    visit_count: int = Field(..., description="访问次数（分量内停留段数）")
+    total_duration_s: float = Field(..., description="成员停留累计时长（秒）")
+    center_lat: float = Field(..., description="热点中心纬度（按停留时长加权平均）")
+    center_lon: float = Field(..., description="热点中心经度（按停留时长加权平均）")
+    first_visit_time: datetime = Field(..., description="最早访问时间（最早停留进入时间）")
+    last_visit_time: datetime = Field(..., description="最近离开时间（最晚停留离开时间）")
+    stay_ids: List[int] = Field(..., description="成员停留的 stay_id（按编号升序）")
+
+
+class HotspotResponse(BaseModel):
+    stays: List[HotspotStay]
+    hotspots: List[Hotspot]
+    stats: Stats
+
+
 class StayResponse(BaseModel):
     stays: List[Stay]
     stats: Stats
