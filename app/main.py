@@ -6,16 +6,29 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from .models import Stay, StayRequest, StayResponse, Stats
-from .staypoint import Point, detect_stays, total_distance_m
+from .hotspot import build_hotspots
+from .models import (
+    Hotspot as HotspotModel,
+    HotspotRequest,
+    HotspotResponse,
+    HotspotStay,
+    HotspotStats,
+    Stats,
+    Stay,
+    StayRequest,
+    StayResponse,
+)
+from .staypoint import Point, StaySegment, detect_stays, total_distance_m
 
 app = FastAPI(
     title="轨迹停留分析 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交带时间戳的有序轨迹，按 Haversine 距离与最短停留时长阈值流式合并连续点，"
         "识别停留区段（含跨采样间断切分），返回停留时长、中心点、原始点范围，"
-        "并提供 GeoJSON 结果与总里程、停留次数统计。"
+        "并提供 GeoJSON 结果与总里程、停留次数统计；"
+        "另支持跨时段热点归并：以停留中心连边求连通分量，"
+        "按访问次数门槛识别热点、其余停留标记为噪声。"
     ),
 )
 
@@ -24,18 +37,20 @@ def _to_points(req: StayRequest) -> List[Point]:
     return [(p.lat, p.lon, p.timestamp) for p in req.points]
 
 
-def _analyze(req: StayRequest) -> StayResponse:
-    points = _to_points(req)
+def _detect_segments(req: StayRequest) -> List[StaySegment]:
     max_gap_s = (
         req.max_gap_s if req.max_gap_s is not None else 4 * req.min_stay_duration_s
     )
-    segments = detect_stays(
-        points,
+    return detect_stays(
+        _to_points(req),
         distance_threshold_m=req.distance_threshold_m,
         min_stay_duration_s=req.min_stay_duration_s,
         max_gap_s=max_gap_s,
     )
-    stays = [
+
+
+def _build_stays(segments: List[StaySegment]) -> List[Stay]:
+    return [
         Stay(
             stay_id=i + 1,
             center_lat=seg.center_lat,
@@ -49,17 +64,26 @@ def _analyze(req: StayRequest) -> StayResponse:
         )
         for i, seg in enumerate(segments)
     ]
+
+
+def _build_stats(points: List[Point], stays: List[Stay]) -> Stats:
     total_duration_s = (
         (points[-1][2] - points[0][2]).total_seconds() if len(points) > 1 else 0.0
     )
-    stats = Stats(
+    return Stats(
         point_count=len(points),
         total_distance_m=round(total_distance_m(points), 3),
         total_duration_s=total_duration_s,
         stay_count=len(stays),
         total_stay_duration_s=sum(s.duration_s for s in stays),
     )
-    return StayResponse(stays=stays, stats=stats)
+
+
+def _analyze(req: StayRequest) -> StayResponse:
+    points = _to_points(req)
+    segments = _detect_segments(req)
+    stays = _build_stays(segments)
+    return StayResponse(stays=stays, stats=_build_stats(points, stays))
 
 
 @app.get("/health", summary="健康检查")
@@ -74,6 +98,49 @@ def health() -> dict:
 )
 def analyze_stays(req: StayRequest) -> StayResponse:
     return _analyze(req)
+
+
+@app.post(
+    "/api/v1/hotspots",
+    response_model=HotspotResponse,
+    summary="跨时段热点归并（停留 -> 连通分量 -> 热点 / 噪声）",
+)
+def analyze_hotspots(req: HotspotRequest) -> HotspotResponse:
+    points = _to_points(req)
+    segments = _detect_segments(req)
+    stays = _build_stays(segments)
+
+    labels, hotspots = build_hotspots(
+        segments,
+        hotspot_radius_m=req.hotspot_radius_m,
+        min_visits=req.min_visits,
+    )
+
+    hotspot_stays = [
+        HotspotStay(**s.model_dump(), hotspot_id=labels[i])
+        for i, s in enumerate(stays)
+    ]
+    hotspot_models: List[HotspotModel] = [
+        HotspotModel(
+            hotspot_id=h.hotspot_id,
+            center_lat=h.center_lat,
+            center_lon=h.center_lon,
+            visit_count=h.visit_count,
+            total_duration_s=h.total_duration_s,
+            first_visit_time=h.first_visit_time,
+            last_visit_time=h.last_visit_time,
+            stay_ids=[idx + 1 for idx in h.member_indices],
+        )
+        for h in hotspots
+    ]
+
+    base_stats = _build_stats(points, stays)
+    stats = HotspotStats(
+        **base_stats.model_dump(),
+        hotspot_count=len(hotspot_models),
+        noise_count=sum(1 for label in labels if label is None),
+    )
+    return HotspotResponse(stays=hotspot_stays, hotspots=hotspot_models, stats=stats)
 
 
 @app.post(

@@ -1,4 +1,6 @@
 """API 集成测试。"""
+from datetime import datetime, timezone
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -124,3 +126,154 @@ def test_validation_errors():
     # 非法阈值
     bad2 = {"points": POINTS, "distance_threshold_m": -1}
     assert client.post("/api/v1/stays", json=bad2).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /api/v1/hotspots
+# ---------------------------------------------------------------------------
+
+# 一次访问 = 5 个点、间隔 60s，时长 240s；相邻访问间隔 1820s（> max_gap_s=600
+# 强制切分，< 4*min_stay_duration 时默认 gap 也不影响本场景）。
+# A（39.9000）→ B（39.9027，约 300m）→ C（39.9054，再约 300m）→ D（40.0000，
+# 孤立噪声，约 11km）→ A → B → C → E（39.9500，约 5.6km 外）→ E。
+# 半径 500m 时：A-B-C 经传递连边形成同一热点（A 与 C 相距约 600m，不直接相邻）；
+# E-E 形成第二个热点；D 为噪声。
+HOTSPOT_BASE_TS = 1758412800
+
+
+def _visits() -> list:
+    lat_by_place = {
+        "A": 39.9000,
+        "B": 39.9027,
+        "C": 39.9054,
+        "D": 40.0000,
+        "E": 39.9500,
+    }
+    order = ["A", "B", "C", "D", "A", "B", "C", "E", "E"]
+    pts = []
+    t = HOTSPOT_BASE_TS
+    for place in order:
+        for k in range(5):
+            pts.append(
+                {
+                    "lat": lat_by_place[place] + (1e-6 if k % 2 else -1e-6),
+                    "lon": 116.4000 + (1e-6 if k % 2 else -1e-6),
+                    "timestamp": t + k * 60,
+                }
+            )
+        t += 1820  # 相邻访问首点间隔 1820s（末点至下次首点间隔 1580s > max_gap_s）
+    return pts
+
+
+def _z(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+HOTSPOT_PAYLOAD = {
+    "points": _visits(),
+    "distance_threshold_m": 100,
+    "min_stay_duration_s": 180,
+    "max_gap_s": 600,
+    "hotspot_radius_m": 500,
+    "min_visits": 2,
+}
+
+
+def test_hotspots_transitive_chain_noise_and_stable_ids():
+    resp = client.post("/api/v1/hotspots", json=HOTSPOT_PAYLOAD)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # 9 次访问 -> 9 段停留；前 7 次为 A/B/C/D/A/B/C，最后 2 次为 E/E
+    stays = body["stays"]
+    assert len(stays) == 9
+    assert [s["stay_id"] for s in stays] == list(range(1, 10))
+    assert all(s["duration_s"] == 240.0 for s in stays)
+
+    # A-B-C（stay 1,2,3）传递归并；D（stay 4）噪声；A-B-C（stay 5,6,7）并入同链；
+    # E-E（stay 8,9）独立热点
+    assert [s["hotspot_id"] for s in stays] == [1, 1, 1, None, 1, 1, 1, 2, 2]
+
+    hotspots = body["hotspots"]
+    assert len(hotspots) == 2
+
+    h1, h2 = hotspots
+    assert h1["hotspot_id"] == 1
+    assert h1["visit_count"] == 6
+    assert h1["total_duration_s"] == 1440.0
+    assert h1["stay_ids"] == [1, 2, 3, 5, 6, 7]
+    assert h1["first_visit_time"] == _z(HOTSPOT_BASE_TS)
+    # stay 7 开始于第 7 次访问：6 * 1820 秒后，末点 +240s
+    assert h1["last_visit_time"] == _z(HOTSPOT_BASE_TS + 6 * 1820 + 240)
+    # 加权中心 = 各停留时长相同 -> 算术平均
+    assert abs(h1["center_lat"] - (39.9 + 39.9027 + 39.9054) / 3) < 1e-3
+    assert abs(h1["center_lon"] - 116.4) < 1e-4
+
+    assert h2["hotspot_id"] == 2
+    assert h2["visit_count"] == 2
+    assert h2["total_duration_s"] == 480.0
+    assert h2["stay_ids"] == [8, 9]
+    # stay 8 开始于第 8 次访问：7 * 1820 秒后
+    assert h2["first_visit_time"] == _z(HOTSPOT_BASE_TS + 7 * 1820)
+    assert h2["last_visit_time"] == _z(HOTSPOT_BASE_TS + 8 * 1820 + 240)
+    assert abs(h2["center_lat"] - 39.95) < 1e-4
+
+    stats = body["stats"]
+    assert stats["point_count"] == 45
+    assert stats["stay_count"] == 9
+    assert stats["hotspot_count"] == 2
+    assert stats["noise_count"] == 1
+    assert stats["total_stay_duration_s"] == 9 * 240.0
+
+
+def test_hotspots_no_qualifying_visits_marks_all_noise():
+    payload = {**HOTSPOT_PAYLOAD, "min_visits": 4}
+    # E-E 只有 2 次；A-B-C 链 6 次仍达标
+    body = client.post("/api/v1/hotspots", json=payload).json()
+    assert [h["visit_count"] for h in body["hotspots"]] == [6]
+    assert body["stats"]["hotspot_count"] == 1
+    assert body["stats"]["noise_count"] == 3
+
+    payload = {**HOTSPOT_PAYLOAD, "min_visits": 7}
+    body = client.post("/api/v1/hotspots", json=payload).json()
+    assert body["hotspots"] == []
+    assert all(s["hotspot_id"] is None for s in body["stays"])
+    assert body["stats"]["hotspot_count"] == 0
+    assert body["stats"]["noise_count"] == 9
+
+
+def test_hotspots_no_stays_detected():
+    # 每个点相距足够远，无法形成停留
+    payload = {
+        "points": [
+            {"lat": 39.9 + i * 0.01, "lon": 116.4, "timestamp": 1758412800 + i * 60}
+            for i in range(4)
+        ],
+        "hotspot_radius_m": 500,
+        "min_visits": 2,
+    }
+    resp = client.post("/api/v1/hotspots", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["stays"] == []
+    assert body["hotspots"] == []
+    assert body["stats"]["stay_count"] == 0
+    assert body["stats"]["hotspot_count"] == 0
+    assert body["stats"]["noise_count"] == 0
+
+
+def test_hotspots_validation_errors():
+    # radius 必须为正
+    bad = {**HOTSPOT_PAYLOAD, "hotspot_radius_m": 0}
+    assert client.post("/api/v1/hotspots", json=bad).status_code == 422
+    # min_visits 至少为 1
+    bad = {**HOTSPOT_PAYLOAD, "min_visits": 0}
+    assert client.post("/api/v1/hotspots", json=bad).status_code == 422
+    # 缺少必填的归并参数
+    bad = {"points": POINTS, "distance_threshold_m": 100}
+    assert client.post("/api/v1/hotspots", json=bad).status_code == 422
+    # 沿用停留参数的校验
+    bad = {"points": [], "hotspot_radius_m": 100, "min_visits": 2}
+    assert client.post("/api/v1/hotspots", json=bad).status_code == 422
